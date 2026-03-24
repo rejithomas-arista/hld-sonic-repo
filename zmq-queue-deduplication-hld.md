@@ -175,7 +175,7 @@ Three approaches were evaluated for concurrent access between the poll thread (p
 | **Selective pop under lock** | O(batch_size) = O(1024) | No | Simple | Fixed O(1024) regardless of queue depth |
 | **Double-buffer** (chosen) | O(1) index flip | No | Simple — complete isolation between threads | O(1) lock regardless of queue depth |
 
-The **swap-out + merge-back** approach has O(R) lock hold time during merge-back, where R is the number of unprocessed keys beyond the batch limit. At scale (100K+ routes), this can reach 5ms+, stalling the poll thread. It also requires subtle correctness guards to ensure newer poll thread entries take precedence over older local leftovers (see [correctness proof](zmq-dedup-correctness-proof.md)).
+The **swap-out + merge-back** approach has O(R) lock hold time during merge-back, where R is the number of unprocessed keys beyond the batch limit. At scale (100K+ routes) and on a busy CPU, this theoretically can become large stalling the poll thread. It also requires subtle correctness guards to ensure newer poll thread entries take precedence over older local leftovers.
 
 The **selective pop** approach holds the lock for the entire pop loop (~50-100μs for 1024 entries), avoiding merge-back but blocking the poll thread during processing.
 
@@ -239,22 +239,11 @@ Step 3 (O(1) under lock):
 
 **Trade-off**: Entries arriving during processing go to the **other** buffer, so there is no cross-buffer dedup. This is acceptable — it matches the original queue behavior where entries in separate `pops()` calls were never deduplicated. The dedup win is within a single accumulation period, which is where the 7x duplication occurs.
 
-##### 5.1.3.5. Correctness
-
-The double-buffer design avoids all merge-back correctness concerns because the two buffers are fully independent:
-
-- **INV1 (Completeness)**: Each buffer independently maintains the invariant that every key in `pendingKeys` has a corresponding entry in `stateTable` or `deletedKeys`. `handleReceivedData()` ensures this for the write buffer. The read buffer is frozen (poll thread doesn't touch it).
-- **INV2 (No duplicates)**: Each buffer independently tracks first-encounter via its own maps. No cross-buffer key tracking needed.
-- **INV3 (Disjointness)**: Each buffer independently ensures `stateTable` and `deletedKeys` are disjoint.
-- **INV4 (Recency)**: Within each buffer, last-writer-wins. Across buffers, the read buffer contains older entries and the write buffer contains newer entries — both are processed in order (read buffer first).
-
-No guards, no ordering constraints, no subtle merge semantics.
-
-#### 5.1.4. AsyncDBUpdater Interaction
+#### 5.1.3. AsyncDBUpdater Interaction
 
 When `dbPersistence=true`, each operation is cloned and sent to `AsyncDBUpdater` **before deduplication**, preserving existing behavior. This is safe because Redis (APP_DB) is a key-value store that naturally deduplicates, `AsyncDBUpdater` runs on a separate low-priority thread, and no hot-path consumer reads APP_DB. No changes are needed to `AsyncDBUpdater`.
 
-#### 5.1.5. Restart and Reload Safety
+#### 5.1.4. Restart and Reload Safety
 
 Deduplication happens entirely within the ingestion queue — before entries reach orchagent's `m_toSync` or the ASIC. All three restart/reload paths are safe because they operate on data structures downstream of the dedup queue.
 
@@ -276,22 +265,14 @@ Dedup may collapse multiple SETs for the same route during the replay, but the f
 **Warm restart (traffic-preserving restart):**
 orchagent restarts while the ASIC continues forwarding. The reconciliation path reads APP_DB directly — it does not go through the ZMQ dedup queue:
 
-1. `bake()` calls `refillToSync()` for each orch, which reads all existing keys from APP_DB via `Table(db, tableName).getKeys()` and loads them into `m_toSync` as SET entries (`orch.cpp:250-270`)
-2. Three `doTask()` iterations process everything in `m_toSync`, reconciling the pre-existing APP_DB state against the ASIC (`orchdaemon.cpp:1080-1093`)
+1. `bake()` calls `refillToSync()` for each orch, which reads all existing keys from APP_DB via `Table(db, tableName).getKeys()` and loads them into `m_toSync` as SET entries.
+2. Three `doTask()` iterations process everything in `m_toSync`, reconciling the pre-existing APP_DB state against the ASIC.
 3. `warmRestoreValidation()` verifies `m_toSync` is empty — all pre-existing data was processed
 4. `syncd_apply_view()` switches syncd from comparison mode to live mode
 5. Only after reconciliation completes does the Select loop start, and ZMQ entries begin being consumed from the dedup queue
 
 The ZMQ poll thread may receive data from fpmsyncd during warm restart, but those entries accumulate in the dedup buffers and are not consumed until the Select loop starts. Since APP_DB gets un-deduped writes via `AsyncDBUpdater` and Redis naturally deduplicates (last-writer-wins), APP_DB state used by `bake()` is always correct.
 
-#### 5.1.6. Compatibility with Existing Optimizations
-
-| Feature | Compatible? | Notes |
-| ------- | ----------- | ----- |
-| BGP PIC / NHG | Yes | Separate `ZmqConsumerStateTable` instances per table. No cross-table interference. |
-| SAI Bulk APIs | Complementary | 70K/64 = 1,094 bulk calls → 10K/64 = 157 bulk calls. |
-| gBatchSize | Compatible | Dedup still needed — queue grows faster than it drains during churn. |
-| Warm restart | Safe | Dedup is upstream of `m_toSync` and APP_DB reconciliation. |
 
 ### 5.2. Phase 2: RingBuffer Integration for ZmqConsumer
 
