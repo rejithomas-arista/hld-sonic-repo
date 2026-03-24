@@ -38,7 +38,6 @@
 | Rev  |    Date    |       Author       | Change Description |
 | :--: | :--------: | :----------------: | :----------------: |
 | 0.1  | 2026-03-07 |    Reji Thomas     | Initial version    |
-| 0.2  | 2026-03-20 |    Reji Thomas     | Double-buffer design for thread safety |
 
 ## 2. Definitions/Abbreviations
 
