@@ -71,7 +71,7 @@ In the traditional Redis-based path, deduplication happens naturally: Redis is a
 
 During BGP convergence events, `fpmsyncd` sends a burst of route updates. Many of these are redundant — the same route key is updated multiple times in rapid succession (e.g., nexthop changes, route flapping). The `ZmqConsumerStateTable` queue stores every operation without deduplication, leading to unbounded queue growth.
 
-Observed during `test_bgp_update_replication.py`:
+Observed during `test_bgp_update_replication.py` against vpp. The test does a series of route announce and withdrawals:
 
 | Timestamp | Queue Size |
 | --------- | ---------- |
@@ -79,7 +79,7 @@ Observed during `test_bgp_update_replication.py`:
 | 13:23:17  | 3,350      |
 | 13:25:15  | 69,485     |
 
-With ~10,000 unique routes, the queue accumulated ~70,000 operations — an average of 7 redundant operations per route — consuming ~68 MB of memory and ~35 seconds of processing time.
+With ~10,000 unique routes, the queue accumulated ~70,000 operations — an average of 7 redundant operations per route — consuming ~68 MB of memory.If we wait for all these events to be processed and reflected in forwarding plane, test can run to 3-4 hours.(The test today checks only BGP rib convergence and hence doesnt have the time overhead)
 
 #### 4.1.3. Why the Queue Grows
 
@@ -301,11 +301,11 @@ RingBuffer alone does not solve queue growth: the RingBuffer has only 30 slots, 
 
 #### 5.2.3. Future: Remove Batch Limit in pops() (Phase 3)
 
-With the double-buffer design (§5.1.3), the lock hold time is already O(1) regardless of queue depth. However, the batch limit (`m_popBatchSize`) still limits how many entries `pops()` returns per call. When the RingBuffer is active (`ring_thread_enabled=true` in CONFIG_DB), this limit can be safely removed.
+With the double-buffer design, the lock hold time is already O(1) regardless of queue depth. However, the batch limit (`m_popBatchSize`) still limits how many entries `pops()` returns per call. When the RingBuffer is active (`ring_thread_enabled=true` in CONFIG_DB), this limit can be safely removed.
 
 **Analysis:**
 
-- The RingBuffer is registered **only** for `APP_ROUTE_TABLE_NAME` (see `Orch::addExecutor()` — line 935 of `orch.cpp`). No other orch uses it.
+- The RingBuffer is registered **only** for `APP_ROUTE_TABLE_NAME` (see `Orch::addExecutor()` ). No other orch uses it.
 - `ZmqConsumer::execute()` calls `pops()` on the **main thread**, then pushes `addToSync()` + `drain()` to the **ring thread** via `processAnyTask()`. The main thread returns to the Select loop immediately.
 - The batch limit existed to give other orchs CPU time on the main thread. With the ring thread doing all processing, the main thread only performs `pops()` — whether it returns 1K or 100K entries, the main thread returns to Select in the same time.
 - The SAI bulker internally chunks bulk calls to `gMaxBulkSize` (1000), so large batches are handled correctly.
