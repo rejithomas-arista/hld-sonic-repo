@@ -83,14 +83,24 @@ With ~10,000 unique routes, the queue accumulated ~70,000 operations — an aver
 
 #### 4.1.3. Why the Queue Grows
 
-The orchagent main thread processes route batches **synchronously**: each batch goes through `addToSync()` → `drain()` → `doTask()` → SAI API calls. SAI calls are blocking — the main thread waits for the ASIC to respond before returning to process the next batch. This chunked processing is intentional: it ensures other orchagent components (portsorch, aclorch, etc.) get CPU time in the shared Select loop.
+The internal queue grows because the ZMQ poll thread (producer) pushes entries faster than orchagent (consumer) can drain them. Several factors contribute:
 
-While the main thread is blocked on SAI calls, the ZMQ poll thread (a separate thread) continues receiving data from `fpmsyncd` and pushing to the queue. The queue grows because the producer (ZMQ poll thread) is faster than the consumer (main thread blocked on SAI).
+1. **Synchronous SAI calls in sync mode.** Most deployments run with `synchronous_mode: enable`. In this mode, each SAI bulk call writes to ASIC_DB and blocks waiting for syncd to process and respond. The orchagent processing thread (whether main thread or ring thread) is blocked during this wait, slowing the drain rate.
+
+2. **No deduplication at ingestion.** The ZMQ path's internal queue stores every operation without deduplication. During BGP churn — route flapping, nexthop changes, ECMP path updates, or announce/withdraw cycles — the same route key gets queued multiple times. In the Redis path, HSET naturally overwrites the previous value for the same key. The ZMQ path loses this natural dedup.
+
+3. **ZmqConsumer::execute() was not using the RingBuffer.** The BGP Loading Optimization introduced a RingBuffer assistant thread (`processAnyTask()`) to decouple `pops()` from `addToSync()+drain()`. However, `ZmqConsumer::execute()` was implemented separately and calls `addToSync()+drain()` directly on the main thread, bypassing the RingBuffer entirely. This means the main thread blocks on SAI calls and cannot return to the Select loop to drain the queue.
+
+The RingBuffer (Phase 2 of this design) partially alleviates the buildup. With the RingBuffer, the main thread pushes a lambda to the ring and returns to `pops()` immediately. However, the ring has only 30 slots. Each slot holds whatever `pops()` returns — which could be anywhere from a single entry to `gBatchSize` (default 1024) entries depending on what's in the queue at that moment. In sync mode, the ring thread blocks on each SAI round-trip before freeing a slot. If churn rate exceeds the SAI drain rate, the ring fills and the main thread stalls, allowing the internal queue to grow again.
+
+Async mode would allow the ring thread to drain faster since sairedis writes to ASIC_DB without waiting for syncd. However, async mode breaks FIB suppression (`suppress-fib-pending`) and has had stability issues. Most production deployments use sync mode.
+
+Even when the queue does drain fast enough to avoid buildup, the lack of deduplication means every redundant entry still flows through the entire processing pipeline — `addToSync()` → `doTask()` → SAI bulk calls — wasting CPU and extending convergence time.
 
 Deduplication exists in `addToSync()`, but it only collapses entries **within a single batch**. Duplicates across batches are not detected.
 
 ![Queue Growth Problem](images/zmq-queue-growth.png)
-*Figure 2: Queue growth during BGP churn — ZMQ poll thread pushes faster than main thread drains*
+*Figure 2: Queue growth during BGP churn — ZMQ poll thread pushes faster than orchagent drains*
 
 ### 4.2. Solution
 
@@ -295,9 +305,13 @@ However, `ZmqConsumer::execute()` was implemented separately and calls `addToSyn
 | Main thread blocks on SAI? | Yes             | No                   | No       |
 | Wall-clock time            | Better          | Better               | **Best** |
 
-Phase 1 reduces **total work** (85% fewer operations). Phase 2 adds **parallelism** (main thread doesn't block on SAI). They are complementary.
+Phase 1 reduces **total work** — fewer redundant operations through `addToSync()` → `doTask()` → SAI. Phase 2 adds **parallelism** — main thread doesn't block on SAI. They are complementary.
 
-RingBuffer alone does not solve queue growth: the RingBuffer has only 30 slots, and when full, the main thread spin-waits. All 70K entries still pass through `addToSync()`, just on the ring thread instead of the main thread.
+RingBuffer alone (Phase 2 without Phase 1) does not eliminate the problem. In sync mode, the ring thread blocks on each SAI bulk round-trip before freeing a slot. If churn rate exceeds SAI drain rate, the ring fills and the main thread stalls, allowing the internal queue to grow. Even when the ring keeps up, all redundant entries still flow through the processing pipeline — each one consumes a SAI bulk call slot, burns CPU in RouteOrch, and extends convergence time.
+
+Dedup alone (Phase 1 without Phase 2) bounds the queue and eliminates redundant work, but the main thread still blocks on SAI calls since `ZmqConsumer::execute()` doesn't use `processAnyTask()`.
+
+Both together give bounded queues, no redundant work, and no main-thread blocking.
 
 #### 5.2.3. Future: Remove Batch Limit in pops() (Phase 3)
 
