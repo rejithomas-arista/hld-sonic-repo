@@ -204,13 +204,13 @@ The two approaches are complementary and the implementation supports both. Inter
 
 ### 4.2. Solution
 
-Implement IPIP tunnel support in three phases. Phases 2 and 3 are platform-agnostic (SAI-based orchagent changes, FRR patch). Phase 1 requires a SAI provider change per platform; VPP is the initial target.
+Implement IPIP tunnel support in three phases, organized by deployable capability. Each phase is independently testable and deployable, with dependencies flowing from Phase 1 → Phase 3.
 
-1. **Phase 1 — SAI Provider Decapsulation (VPP first)**: Accept `SAI_TUNNEL_TYPE_IPINIP` in the VPP SAI provider (`TunnelManager.cpp`), translate to VPP `ipip_add_tunnel` API calls, and handle P2P/P2MP decapsulation with DSCP/ECN/TTL modes. This unblocks the existing SONiC control plane decap path. On other platforms, this phase requires the respective SAI provider to implement `SAI_TUNNEL_TYPE_IPINIP` — the orchagent path is already in place.
+1. **Phase 1 — Interface Mode and Decap-Only (Modes 1 and 2)**: Implement the full end-to-end IPIP solution for interface-based tunnels and decap-only tunnels. This includes: VPP SAI provider IPINIP support (`TunnelManager.cpp`), TunnelIpipMgr orchestration component, kernel `iptun<N>` interface management, optional BFD integration, fpmsyncd IPIP tunnel detection, and RouteOrch IPIP nexthop resolution. Mode 1 provides full bidirectional tunneling with FRR control plane participation. Mode 2 provides data-plane-only decapsulation. No FRR changes required. Works on any platform with SAI IPIP support; VPP is the initial validation target.
 
-2. **Phase 2 — Encapsulation with BFD (Interface-Based, platform-agnostic)**: Introduce `TunnelIpipMgr` as the central tunnel lifecycle manager. For each tunnel, it creates a SAI tunnel (data plane) and a kernel tunnel interface (control plane), following the dual-path architecture from §4.1.2. Optional BFD sessions track tunnel reachability; BFD failure triggers `ip link set tun0 down`, causing FRR to withdraw routes. This phase uses the interface-based approach (§4.1.3, Approach 1) and works on any platform with SAI IPIP support, without FRR changes.
+2. **Phase 2 — FRR Tunnel Nexthop-Group Support (standalone FRR feature)**: Extend FRR with generic tunnel encapsulation support in nexthop-groups. This is a standalone FRR feature, independent of SONiC, and suitable for upstream contribution. Includes: `encap ip src <IP>` parameter in nexthop-group CLI, IPIP encap fields in `struct nexthop` and `zapi_nexthop`, `LWTUNNEL_ENCAP_IP` encoding/parsing in zebra, `ip route ... nexthop-group <NAME>` in staticd, and PBR encap field support. This enables FRR to natively manage IPIP tunnel nexthops with ECMP and mixed tunnel/non-tunnel nexthop groups.
 
-3. **Phase 3 — FRR Patch (Nexthop-Based Scaling, platform-agnostic)**: Add `LWTUNNEL_ENCAP_IP` support to FRR's `netlink_nexthop_process_nh()`, enabling kernel nexthop objects with IPIP encapsulation to be correctly interpreted by FRR. This unblocks the nexthop-based approach (§4.1.3, Approach 2), removing the ~1000 tunnel limit and enabling Modes 3 and 4. This patch benefits all SONiC platforms.
+3. **Phase 3 — Nexthop-Based Tunnel Modes (Modes 3 and 4)**: Integrate Phase 2's FRR nexthop-group support with SONiC to enable the nexthop-based tunnel modes. Includes: frrcfgd integration to generate FRR nexthop-group and static route config from CONFIG_DB, fpmsyncd `NHA_ENCAP` parsing for IPIP nexthop metadata, and TunnelIpipMgr `cp_mode=nexthop` path with SAI/FRR coordination. Depends on Phase 2. Removes the ~1000 tunnel scale limit of Mode 1.
 
 ## 5. High-Level Design
 
@@ -1114,60 +1114,82 @@ No kernel objects or FRR interaction. SAI reconciliation via `bake()` + syncd co
 
 ## 6. Expected Impact
 
-### Phase 1 — Decapsulation
+### Phase 1 — Interface Mode and Decap-Only (Modes 1 and 2)
 
-Unblocks IPIP decap use cases on VPP with minimal changes (single file, `TunnelManager.cpp`). The existing SONiC control plane (`tunneldecaporch`, `ipinip.json.j2`) works unmodified. All four protocol combinations (IPv4-in-IPv4, IPv6-in-IPv6, IPv4-in-IPv6, IPv6-in-IPv4) are supported.
-
-### Phase 2 — Encapsulation with BFD
-
-Enables full IPIP tunnel encapsulation with:
+Delivers a complete end-to-end IPIP tunnel solution:
 
 | Capability | Impact |
 |------------|--------|
+| Decapsulation (Mode 2) | P2P, P2MP, MP2MP decap with DSCP/ECN/TTL modes |
+| Bidirectional tunneling (Mode 1) | Full encap + decap with FRR control plane participation |
 | Tunnel lifecycle management | Centralized via TunnelIpipMgr |
 | Tunnel state tracking | Sub-second failure detection via BFD |
 | FRR route withdrawal on failure | Automatic via kernel interface state |
-| ECMP via tunnel nexthops | NhgOrch integration |
 | Platform independence | SAI-based, works on VPP and hardware ASICs |
+| Protocol matrix | IPv4-in-IPv4, IPv6-in-IPv6, IPv4-in-IPv6, IPv6-in-IPv4 |
 
-### Phase 3 — FRR Patch
+### Phase 2 — FRR Tunnel Nexthop-Group Support
 
-Removes the ~1000 tunnel scale limit by enabling Modes 3 and 4, which use kernel nexthop objects instead of kernel interfaces. No upper bound on tunnel count.
+Standalone FRR feature, suitable for upstream contribution:
+
+| Capability | Impact |
+|------------|--------|
+| Tunnel nexthop-groups | `encap ip src` in nexthop-group CLI |
+| Static route + nexthop-group | `ip route ... nexthop-group <NAME>` in staticd |
+| ECMP with mixed NHs | Tunnel and non-tunnel nexthops in same group |
+| PBR service chaining | `set nexthop-group` with tunnel encap |
+| Generic tunnel framework | Extensible to GRE, SRv6 via same CLI pattern |
+
+### Phase 3 — Nexthop-Based Tunnel Modes (Modes 3 and 4)
+
+Removes the ~1000 tunnel scale limit by enabling Modes 3 and 4, which use FRR nexthop-groups instead of kernel interfaces. Adds frrcfgd integration and fpmsyncd NHA_ENCAP parsing. No upper bound on tunnel count.
 
 ## 7. Testing
 
-### Decapsulation Tests (Phase 1)
+### Phase 1 Tests — Interface Mode and Decap-Only
 
+**Decapsulation (Mode 2):**
 - **P2P decap**: Create tunnel term entry with specific `src_ip`/`dst_ip`, send encapsulated packets, verify decapsulation and inner packet forwarding
 - **P2MP decap**: Create tunnel term entry with only `dst_ip`, verify packets from any source are decapsulated
 - **Protocol matrix**: IPv4-in-IPv4, IPv6-in-IPv6, IPv4-in-IPv6, IPv6-in-IPv4
 - **QoS header handling**: All DSCP (uniform/pipe), ECN (copy/standard), TTL (pipe/uniform) modes
 - **Existing test suite**: `pytest decap/test_decap.py` from sonic-mgmt
 
-### Encapsulation Tests (Phase 2)
-
+**Encapsulation — Interface Mode (Mode 1):**
 - **P2P encap**: Create tunnel with fixed `dst_ip`, add route via tunnel, verify encapsulated packets on egress
 - **P2MP encap**: Create tunnel without `dst_ip`, add multiple routes with different nexthops, verify correct outer dst per route
 - **BFD integration**: Create tunnel with BFD, simulate peer failure, verify kernel interface goes down and FRR withdraws routes
 - **BFD recovery**: Restore peer, verify kernel interface comes up and FRR re-advertises routes
 - **Tunnel without BFD**: Verify tunnel stays UP regardless of reachability (legacy behavior)
-- **ECMP**: Multiple tunnel nexthops, verify load balancing
+- **FRR route via tunnel**: Configure FRR static/BGP route via `iptun0`, verify data plane encapsulation via SAI tunnel nexthop
 
-### FRR Patch Tests (Phase 3)
+### Phase 2 Tests — FRR Tunnel Nexthop-Group
 
-- **Nexthop object**: Create kernel nexthop with `encap ip`, verify `show ip route` displays tunnel info
-- **Route redistribution**: Verify routes with IPIP nexthops are correctly redistributed
+- **Nexthop-group CLI**: Define nexthop-group with `encap ip src`, verify kernel nexthop created with `LWTUNNEL_ENCAP_IP`
+- **Static route via nexthop-group**: `ip route ... nexthop-group <NAME>`, verify route installed in kernel and FRR RIB
+- **ECMP mixed NHs**: Nexthop-group with tunnel and non-tunnel members, verify load balancing
+- **PBR with tunnel NHG**: `set nexthop-group` in pbr-map, verify traffic steering through IPIP tunnel
+- **Route redistribution**: Verify static routes via tunnel nexthop-group are redistributable via BGP
+- **show ip route**: Verify tunnel encap info displayed correctly
 - **IPv4 and IPv6**: Test with both address families
+
+### Phase 3 Tests — Nexthop-Based Modes
+
+- **Mode 3 end-to-end**: CONFIG_DB tunnel + route → frrcfgd → FRR → fpmsyncd → RouteOrch → SAI encap
+- **Mode 4 end-to-end**: Same as Mode 3 encap + IPIP decap via term entry
+- **SAI coordination**: Verify RouteOrch resolves FRR-driven routes to TunnelIpipMgr's SAI tunnel nexthop
+- **Scale**: 1000+ nexthop-based tunnels, verify no kernel interface limit
 
 ### Scale and Negative Tests
 
-- **Scale**: 256+ tunnels, 1000+ routes per tunnel
+- **Scale**: 256+ tunnels (Mode 1), 1000+ tunnels (Modes 3/4), 1000+ routes per tunnel
 - **Error handling**: Invalid configuration rejection, tunnel deletion with active routes, MTU exceeded, loop prevention via TTL
 
 ### Regression
 
 - **VXLAN**: Verify no regression in existing VXLAN tunnel functionality
-- **Warm restart**: Verify tunnels survive warm reboot
+- **Dual-ToR**: Verify no regression in MuxOrch IPIP functionality
+- **Warm restart**: Verify tunnels survive warm reboot (all modes)
 - **Config reload**: Verify tunnels restored after config reload
 
 ## 8. Links to Code PRs
