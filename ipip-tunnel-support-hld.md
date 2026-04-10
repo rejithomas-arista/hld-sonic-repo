@@ -1088,12 +1088,29 @@ The YANG models enforce disjoint key patterns. Users configure generic IPIP tunn
 
 #### 5.7.5. Warm Restart
 
-Warm restart handling for TunnelIpipMgr is deferred to a future revision. Initial deployment supports cold restart only. Key considerations for future warm restart support:
+During warm restart, orchagent restarts while the kernel, VPP/ASIC, and FRR continue running. The data plane is uninterrupted. TunnelIpipMgr uses the standard orchagent warm restart reconciliation framework.
 
-- SAI tunnel and nexthop objects must be reconciled with pre-existing ASIC state after restart
-- Kernel tunnel interfaces (`iptun<N>`) and nexthop objects must be preserved across restart
-- BFD sessions must be re-established without triggering tunnel state flap
-- FRR-driven routes (Modes 3/4) are handled by FRR's own warm restart mechanism
+**SAI reconciliation (all modes):**
+
+orchagent calls `bake()` on all orchs, which calls `refillToSync()` to read all existing keys from `CONFIG_DB:TUNNEL_IPIP` and load them into `m_toSync`. The subsequent `doTask()` iterations re-create SAI objects (tunnel, encap nexthop, decap term entry, BFD session). syncd is in comparison mode during this phase — it compares the re-created SAI objects against the existing ASIC state and performs no ASIC operations for objects that already match. After all orchs complete, `syncd_apply_view()` finalizes the reconciliation.
+
+**Kernel interface reconciliation (Mode 1):**
+
+Kernel `iptun<N>` interfaces survive warm restart because the kernel is not restarted. When TunnelIpipMgr processes the replayed CONFIG_DB entries during `doTask()`, it checks whether the kernel interface already exists (via `if_nametoindex()`) before attempting creation. If the interface exists, creation is skipped and the existing interface is reused. TunnelIpipMgr reads the tunnel-to-interface mapping from STATE_DB (`STATE_TUNNEL_IPIP_TABLE`) and scans existing `iptun*` interfaces at startup to restore the `next_tunnel_instance` counter.
+
+The kernel interface remains UP during restart, so FRR's BGP/OSPF sessions over the tunnel are not disrupted. BFD sessions are re-created via SAI (syncd reconciliation) and TunnelIpipMgr re-registers as a BFD observer.
+
+**FRR and route reconciliation (Mode 1):**
+
+FRR continues running during orchagent restart. Routes via `iptun<N>` remain in the kernel and FRR's RIB. When fpmsyncd restarts and reconnects to FRR, FRR replays all routes via FPM. fpmsyncd re-populates its link cache (via `nl_cache_refill()`), detects IPIP tunnel interfaces, and writes routes with tunnel metadata to APP_ROUTE_TABLE. RouteOrch processes these routes and resolves them via TunnelIpipMgr to the re-created SAI tunnel nexthop. syncd comparison mode ensures no duplicate ASIC programming.
+
+**FRR and route reconciliation (Modes 3/4):**
+
+FRR preserves nexthop-group config and routes across orchagent restart. Kernel nexthop objects (created by zebra) survive because the kernel is not restarted. frrcfgd restarts and re-pushes the FRR config from CONFIG_DB — FRR handles duplicate config gracefully (nexthop-group updates are idempotent). When fpmsyncd reconnects, FRR replays nexthop objects (RTM_NEWNEXTHOP) first, then routes. fpmsyncd rebuilds its `m_nh_groups` map from the replayed nexthop messages and resolves routes normally.
+
+**Mode 2 (decap-only):**
+
+No kernel objects or FRR interaction. SAI reconciliation via `bake()` + syncd comparison mode is sufficient.
 
 ## 6. Expected Impact
 
