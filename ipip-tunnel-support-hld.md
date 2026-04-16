@@ -57,6 +57,12 @@
     - [5.7.3. Kernel Interface IP Assignment (Mode 1)](#573-kernel-interface-ip-assignment-mode-1)
     - [5.7.4. Coexistence with Existing Dual-ToR Tunnel Path](#574-coexistence-with-existing-dual-tor-tunnel-path)
     - [5.7.5. Warm Restart](#575-warm-restart)
+  - [5.8. Packet Fragmentation and MTU Handling](#58-packet-fragmentation-and-mtu-handling)
+    - [5.8.1. Background: Fragmentation Strategies](#581-background-fragmentation-strategies)
+    - [5.8.2. Vendor Behavior Comparison](#582-vendor-behavior-comparison)
+    - [5.8.3. Proposed Behavior for SONiC IPIP Tunnels](#583-proposed-behavior-for-sonic-ipip-tunnels)
+    - [5.8.4. VPP Enhancements (Future Work)](#584-vpp-enhancements-future-work)
+    - [5.8.5. Interaction with Modes](#585-interaction-with-modes)
 - [6. Expected Impact](#6-expected-impact)
 - [7. Testing](#7-testing)
 - [8. Links to Code PRs](#8-links-to-code-prs)
@@ -809,6 +815,8 @@ BFD was chosen over VPP FIB tracking because FIB-based tracking would incorrectl
 | `bfd_min_tx` | Integer | No | 50000–30000000 | `300000` | BFD minimum TX interval in microseconds. Ignored when `bfd_enable=false`. |
 | `bfd_min_rx` | Integer | No | 50000–30000000 | `300000` | BFD minimum RX interval in microseconds. Ignored when `bfd_enable=false`. |
 | `bfd_detect_mult` | Integer | No | 1–255 | `3` | BFD detection multiplier. Ignored when `bfd_enable=false`. |
+| `mtu` | Integer | No | 68–9216 | auto | Tunnel effective MTU (inner payload). If omitted, TunnelIpipMgr calculates as `underlay_mtu - tunnel_overhead` (20 for IPv4 outer, 40 for IPv6 outer). Applied to both kernel tunnel interface and VPP tunnel interface. See §5.8 for fragmentation behavior. |
+| `df_mode` | String | No | `copy`, `set`, `clear` | `copy` | DF bit policy on outer IPv4 header. `copy` = inherit from inner (recommended). `set` = always DF=1. `clear` = always DF=0 (**not recommended** — VPP drops outer fragments at decap). Maps to VPP `ENCAP_COPY_DF` / `ENCAP_SET_DF` flags. See §5.8 for details. |
 | `tunnel_ip` | IP address | No | IPv4 or IPv6 | `src_ip/32` | IP address to assign to the kernel tunnel interface (`iptun<N>`). Only valid when `cp_mode=interface`. Defaults to `src_ip/32` if omitted. Override when a different routable address is needed on the tunnel interface. |
 
 ##### 5.5.4.2. How Fields Determine the Operational Mode
@@ -1113,6 +1121,146 @@ FRR preserves nexthop-group config and routes across orchagent restart. Kernel n
 **Mode 2 (decap-only):**
 
 No kernel objects or FRR interaction. SAI reconciliation via `bake()` + syncd comparison mode is sufficient.
+
+### 5.8. Packet Fragmentation and MTU Handling
+
+IPIP encapsulation adds a 20-byte (IPv4) or 40-byte (IPv6) outer header, reducing the effective payload MTU. When an inner packet plus the tunnel overhead exceeds the underlay path MTU, the tunnel entry point must decide how to handle the oversized packet. This section defines SONiC's fragmentation behavior, aligned with industry practice (Cisco IOS-XR, Juniper JUNOS) and relevant RFCs.
+
+#### 5.8.1. Background: Fragmentation Strategies
+
+[RFC 4459](https://www.rfc-editor.org/rfc/rfc4459) identifies three strategies for tunnel entry points:
+
+| Strategy | Description | Pros | Cons |
+|----------|-------------|------|------|
+| **Pre-fragmentation** | Fragment the inner packet BEFORE encapsulation; each fragment gets its own outer header | No reassembly at tunnel exit; fragments independently routable | Only works for IPv4 inner with DF=0 |
+| **Post-fragmentation** | Encapsulate first, then fragment the outer packet | Works regardless of inner DF bit | Requires reassembly at tunnel exit; buffer-intensive; DoS risk; RFC 4459 discourages this |
+| **Drop + ICMP** | Drop the packet and send ICMP "Fragmentation Needed" (type 3 code 4) back to sender with correct MTU | Most correct; enables PMTUD | Relies on ICMP not being filtered; fragile in practice |
+
+**Industry consensus (Cisco, Juniper, EOS):** Use a combination — pre-fragment when DF=0, drop+ICMP when DF=1. Avoid post-fragmentation (outer reassembly) in the network.
+
+#### 5.8.2. Vendor Behavior Comparison
+
+| Behavior | Cisco IOS/IOS-XR | Juniper JUNOS | VPP (Current) |
+|----------|-----------------|---------------|---------------|
+| **Tunnel MTU** | Auto: physical MTU - overhead | Configurable protocol MTU | Default 9000 (configurable via API) |
+| **DF bit on outer** | Configurable: `tunnel path-mtu-discovery` copies DF from inner; default clears DF | `do-not-fragment` (set), `clear-dont-fragment-bit` (clear), `allow-fragmentation` | Flags: `ENCAP_COPY_DF` (0x01), `ENCAP_SET_DF` (0x02) |
+| **Inner DF=0, packet > tunnel MTU** | Pre-fragments inner, encaps each fragment | Pre-fragments if `clear-dont-fragment-bit` set | No pre-fragmentation |
+| **Inner DF=1, packet > tunnel MTU** | Drop + ICMP "Frag Needed" (with PMTUD); or clear DF on outer (without PMTUD) | Drop + ICMP | No PMTUD; no ICMP generation |
+| **Outer fragments at decap** | Reassembles | Reassembles | **Drops** (`ipip4-input` node.c:110-115) |
+| **PMTUD through tunnel** | `tunnel path-mtu-discovery` | Implicit via tunnel MTU | Not implemented (FEATURE.yaml) |
+
+##### Key VPP Limitations
+
+1. **No pre-fragmentation** — VPP's IPIP encap fixup functions (`ipip44_fixup`, etc. in `ipip.c:138-289`) add the outer header without checking inner packet size against tunnel MTU. No fragmentation occurs at the tunnel entry point.
+
+2. **No tunnel PMTUD** — VPP does not generate ICMP "Fragmentation Needed" messages when an encapsulated packet exceeds the underlay path MTU. Listed as "not implemented" in VPP's `ipip/FEATURE.yaml`.
+
+3. **Outer fragment rejection at decap** — VPP's `ipip4-input` (`node.c:110-115`) drops any packet with the `IP4_HEADER_FLAG_MORE_FRAGMENTS` bit set or IPv6 fragmentation extension headers. Reassembly at tunnel exit is not supported.
+
+4. **VPP tunnel MTU is configurable** — Despite the above limitations, VPP's IPIP API notes: "The tunnel MTU (the payload MTU) is configurable per protocol. If a tunnel MTU is larger than the path MTU, the outer packet will be fragmented." The default is 9000 bytes (`ipip.c:828`), appropriate for datacenter jumbo frame fabrics.
+
+#### 5.8.3. Proposed Behavior for SONiC IPIP Tunnels
+
+##### 5.8.3.1. Tunnel MTU Calculation
+
+TunnelIpipMgr MUST set the tunnel effective MTU based on the underlay path MTU:
+
+```
+tunnel_mtu = underlay_mtu - tunnel_overhead
+
+Where:
+  tunnel_overhead = 20 bytes (IPv4 outer)
+                  = 40 bytes (IPv6 outer)
+```
+
+This MTU is applied at two levels:
+
+| Level | Where | How | Purpose |
+|-------|-------|-----|---------|
+| **Kernel tunnel interface** (Mode 1) | `ip link set iptun0 mtu <tunnel_mtu>` | TunnelIpipMgr | FRR/kernel uses this for route advertisement and TCP MSS clamping |
+| **VPP tunnel interface** | `vnet_sw_interface_set_mtu(sw_if_index, tunnel_mtu)` | SAI VPP provider | VPP uses this for PMTUD (when supported) |
+
+**Default:** If underlay MTU is not configured, assume 9000 (datacenter jumbo). The CONFIG_DB schema accepts an optional `mtu` field:
+
+```json
+"TUNNEL_IPIP|tun0": {
+    "src_ip": "10.1.0.32",
+    "dst_ip": "10.1.0.33",
+    "mtu": "8980"
+}
+```
+
+If omitted, TunnelIpipMgr calculates from the underlay interface MTU.
+
+##### 5.8.3.2. DF Bit Handling
+
+The DF (Don't Fragment) bit on the outer IPv4 header controls whether intermediate routers may fragment the encapsulated packet. SONiC exposes this as a configurable policy:
+
+```json
+"TUNNEL_IPIP|tun0": {
+    "df_mode": "copy"
+}
+```
+
+| `df_mode` Value | Outer DF Bit | VPP Flag | Behavior |
+|-----------------|-------------|----------|----------|
+| `"copy"` (default) | Copied from inner | `ENCAP_COPY_DF` (0x01) | Outer inherits inner DF. Inner DF=1 → outer DF=1 → drop + ICMP if too big. Inner DF=0 → outer DF=0 → underlay may fragment outer. |
+| `"set"` | Always 1 | `ENCAP_SET_DF` (0x02) | All outer packets have DF=1. Underlay never fragments. Sender must use PMTUD to reduce packet size. Most secure. |
+| `"clear"` | Always 0 | (no flag) | All outer packets have DF=0. Underlay fragments freely. Least secure but most permissive. **Not recommended — VPP drops outer fragments at decap.** |
+
+**Recommendation:** Default to `"copy"`, matching Cisco's `tunnel path-mtu-discovery` and Juniper's default behavior.
+
+**Important:** `df_mode: "clear"` is **dangerous with VPP** because VPP's decap path drops outer-fragmented packets. If the outer is fragmented by the underlay and VPP is the decap endpoint, all fragmented packets are silently dropped. Only use `"clear"` when the underlay MTU is guaranteed to be larger than any encapsulated packet.
+
+##### 5.8.3.3. Behavior Matrix
+
+For a tunnel with `tunnel_mtu = 8980` (underlay 9000, IPv4 outer):
+
+| Inner Packet Size | Inner DF Bit | `df_mode` | Action at Tunnel Entry |
+|-------------------|-------------|-----------|----------------------|
+| ≤ 8980 | any | any | Encapsulate normally. Outer = inner + 20 ≤ 9000. No fragmentation needed. |
+| > 8980 | 0 | `copy` | **Phase 1:** Encapsulate; outer > 9000; underlay fragments outer → VPP decap drops fragments. **Future:** Pre-fragment inner to ≤ 8980 chunks, encap each. |
+| > 8980 | 1 | `copy` | DF copied to outer → outer DF=1. Underlay drops + ICMP "Frag Needed" back to tunnel entry. **Future:** Tunnel entry generates ICMP to original sender with MTU=8980. |
+| > 8980 | 0 | `clear` | Encapsulate; outer DF=0; underlay fragments → VPP decap drops fragments. **Broken — do not use.** |
+| > 8980 | 1 | `clear` | Encapsulate; outer DF=0; underlay fragments → VPP decap drops fragments. **Broken — do not use.** |
+| > 8980 | any | `set` | Outer DF=1. Underlay drops + ICMP to tunnel entry. Sender does not learn — packet silently dropped unless tunnel PMTUD is implemented. |
+
+##### 5.8.3.4. Practical Guidance
+
+**Datacenter deployments (jumbo MTU ≥ 9216):**
+- Set underlay MTU to 9216 on all fabric interfaces
+- Tunnel overhead (20 bytes) is negligible: effective inner MTU = 9196
+- Standard 1500-byte packets never hit fragmentation
+- Jumbo frames up to 9196 bytes transit without issues
+- **This is the expected deployment model. Fragmentation is a non-issue.**
+
+**Inter-DC / WAN deployments (1500 MTU underlay):**
+- Tunnel effective MTU = 1480 (IPv4 outer) or 1460 (IPv6 outer)
+- TCP traffic: Kernel and FRR advertise tunnel MTU via routing. TCP MSS clamping reduces segment size. No fragmentation.
+- UDP/non-TCP traffic > 1480: Depends on DF bit and `df_mode`. With `df_mode: "copy"` and DF=1, sender must support PMTUD.
+- **Recommendation:** Use `df_mode: "copy"` and ensure tunnel MTU is correctly configured.
+
+#### 5.8.4. VPP Enhancements (Future Work)
+
+The following VPP enhancements would bring SONiC to parity with Cisco/Juniper. These are **not required for Phase 1** (datacenter jumbo MTU) but needed for WAN/general-purpose deployments:
+
+| Enhancement | Description | Priority |
+|-------------|-------------|----------|
+| **Pre-fragmentation** | Fragment inner IPv4 packet (DF=0) before encapsulation at tunnel entry | Medium — needed for WAN with non-TCP traffic |
+| **Tunnel PMTUD** | Generate ICMP "Fragmentation Needed" back to original sender when encapsulated packet exceeds underlay path MTU and inner DF=1 | Medium — needed for WAN |
+| **Outer fragment reassembly** | Reassemble outer-fragmented packets at `ipip4-input` before decap | Low — RFC 4459 discourages this; pre-fragmentation at entry is preferred |
+| **Dynamic path MTU tracking** | Track underlay path MTU changes and adjust tunnel MTU automatically | Low — operational convenience |
+
+#### 5.8.5. Interaction with Modes
+
+| Mode | Fragmentation Handling |
+|------|----------------------|
+| **Mode 1 (Interface)** | Kernel tunnel interface has MTU set by TunnelIpipMgr. Kernel pre-fragments inner packets > tunnel MTU for DF=0. ICMP generated for DF=1. This works correctly regardless of VPP limitations because the kernel handles fragmentation before packets reach VPP. |
+| **Mode 2 (Decap-Only)** | No encap → no fragmentation concern at this node. Remote encapsulator is responsible. VPP drops outer-fragmented incoming packets — document as known behavior. |
+| **Mode 3 (Encap-Only)** | VPP handles encap directly. Subject to VPP limitations (no pre-fragmentation, no PMTUD). Rely on jumbo MTU underlay. |
+| **Mode 4 (Bidirectional)** | Combination of Mode 2 + Mode 3 concerns. |
+
+**Mode 1 advantage:** Because Mode 1 uses a kernel tunnel interface, the Linux kernel's built-in fragmentation handling (pre-fragmentation, PMTUD, ICMP generation) protects against all oversized-packet scenarios. The kernel fragments before the packet reaches VPP's encap path. This is a significant advantage of Mode 1 over Modes 3/4 for non-jumbo environments.
 
 ## 6. Expected Impact
 
