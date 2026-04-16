@@ -56,7 +56,8 @@
     - [5.7.2. Kernel Interface Naming (Mode 1)](#572-kernel-interface-naming-mode-1)
     - [5.7.3. Kernel Interface IP Assignment (Mode 1)](#573-kernel-interface-ip-assignment-mode-1)
     - [5.7.4. Coexistence with Existing Dual-ToR Tunnel Path](#574-coexistence-with-existing-dual-tor-tunnel-path)
-    - [5.7.5. Warm Restart](#575-warm-restart)
+    - [5.7.5. VRF Scope](#575-vrf-scope)
+    - [5.7.6. Warm Restart](#576-warm-restart)
   - [5.8. Packet Fragmentation and MTU Handling](#58-packet-fragmentation-and-mtu-handling)
     - [5.8.1. Background: Fragmentation Strategies](#581-background-fragmentation-strategies)
     - [5.8.2. Vendor Behavior Comparison](#582-vendor-behavior-comparison)
@@ -1096,7 +1097,18 @@ The new `TUNNEL_IPIP` table and the existing `CFG_TUNNEL_TABLE` serve different 
 
 The YANG models enforce disjoint key patterns. Users configure generic IPIP tunnels exclusively via `TUNNEL_IPIP`. Dual-ToR tunnels continue using `CFG_TUNNEL_TABLE`. No runtime conflict detection is needed.
 
-#### 5.7.5. Warm Restart
+#### 5.7.5. VRF Scope
+
+All IPIP tunnels operate in the **default VRF**. This is consistent with every other tunnel type in SONiC — VXLAN (`vxlanorch.cpp`), NVGRE (`nvgreorch.cpp`), SRv6 (`srv6orch.cpp`), and dual-ToR IPIP (`muxorch.cpp`) all use `gUnderlayIfId`, a single global underlay loopback RIF created at startup in the default VRF (`gVirtualRouterId`).
+
+Supporting non-default underlay VRFs would require:
+1. Per-VRF (or per-tunnel) underlay RIF instead of the global `gUnderlayIfId`
+2. VRF-aware tunnel term entries (`SAI_TUNNEL_TERM_TABLE_ENTRY_ATTR_VR_ID` set to the correct VRF's virtual router OID)
+3. VPP SAI provider creating tunnels in the correct FIB table (VPP's `ipip_tunnel_key_t` includes `fib_index`)
+
+This is a cross-cutting change affecting the entire SONiC tunnel infrastructure and is outside the scope of this HLD. Multi-VRF tunnel support should be addressed as a separate SONiC-wide enhancement applicable to all tunnel types.
+
+#### 5.7.6. Warm Restart
 
 During warm restart, orchagent restarts while the kernel, VPP/ASIC, and FRR continue running. The data plane is uninterrupted. TunnelIpipMgr uses the standard orchagent warm restart reconciliation framework.
 
