@@ -32,25 +32,14 @@
     - [5.3.1. fpmsyncd: IPIP Tunnel Interface Detection](#531-fpmsyncd-ipip-tunnel-interface-detection)
     - [5.3.2. RouteOrch: IPIP Tunnel Nexthop Resolution](#532-routeorch-ipip-tunnel-nexthop-resolution)
     - [5.3.3. Complete Mode 1 Data Flow](#533-complete-mode-1-data-flow)
-  - [5.4. Phase 1: VPP SAI Decapsulation](#54-phase-1-vpp-sai-decapsulation)
-    - [5.4.1. Accept IPIP Tunnel Type in TunnelManager](#541-accept-ipip-tunnel-type-in-tunnelmanager)
-    - [5.4.2. IPIP Tunnel Creation via VPP API](#542-ipip-tunnel-creation-via-vpp-api)
-    - [5.4.3. DSCP/ECN/TTL Header Handling](#543-dscpecnttl-header-handling)
-    - [5.4.4. IPIP Tunnel Deletion](#544-ipip-tunnel-deletion)
-  - [5.5. Phase 2: IPIP Encapsulation with BFD Integration](#55-phase-2-ipip-encapsulation-with-bfd-integration)
-    - [5.5.1. TunnelIpipMgr — New Orchestration Component](#551-tunnelipipmgr--new-orchestration-component)
-    - [5.5.2. Dual-Path Architecture](#552-dual-path-architecture)
-    - [5.5.3. BFD-Based Tunnel State Management](#553-bfd-based-tunnel-state-management)
-    - [5.5.4. CONFIG_DB Schema](#554-config_db-schema)
-      - [5.5.4.1. Field Definitions](#5541-field-definitions)
-      - [5.5.4.2. How Fields Determine the Operational Mode](#5542-how-fields-determine-the-operational-mode)
-      - [5.5.4.3. Validation Rules](#5543-validation-rules)
-      - [5.5.4.4. Configuration Examples](#5544-configuration-examples)
-    - [5.5.5. NhgOrch and RouteOrch Integration](#555-nhgorch-and-routeorch-integration)
-  - [5.6. Phase 3: FRR Patch for Kernel Nexthop IPIP Encapsulation](#56-phase-3-frr-patch-for-kernel-nexthop-ipip-encapsulation)
-    - [5.6.1. Root Cause — FRR Only Handles MPLS Encapsulation](#561-root-cause--frr-only-handles-mpls-encapsulation)
-    - [5.6.2. Required FRR Changes](#562-required-frr-changes)
-    - [5.6.3. Impact on Tunnel Modes](#563-impact-on-tunnel-modes)
+  - [5.4. Phase 1: Interface Mode and Decap-Only (Modes 1 and 2)](#54-phase-1-interface-mode-and-decap-only-modes-1-and-2)
+    - [5.4.1. VPP SAI Provider Changes](#541-vpp-sai-provider-changes)
+    - [5.4.2. IPIP Encapsulation with BFD Integration](#542-ipip-encapsulation-with-bfd-integration)
+  - [5.5. Phase 2: FRR Patch for Kernel Nexthop IPIP Encapsulation](#55-phase-2-frr-patch-for-kernel-nexthop-ipip-encapsulation)
+    - [5.5.1. Root Cause — FRR Only Handles MPLS Encapsulation](#551-root-cause--frr-only-handles-mpls-encapsulation)
+    - [5.5.2. Required FRR Changes](#552-required-frr-changes)
+    - [5.5.3. Impact on Tunnel Modes](#553-impact-on-tunnel-modes)
+  - [5.6. Phase 3: Nexthop-Based Tunnel Modes (Modes 3 and 4)](#56-phase-3-nexthop-based-tunnel-modes-modes-3-and-4)
   - [5.7. Implementation Considerations](#57-implementation-considerations)
     - [5.7.1. YANG Model](#571-yang-model)
     - [5.7.2. Kernel Interface Naming (Mode 1)](#572-kernel-interface-naming-mode-1)
@@ -114,7 +103,7 @@ SONiC's tunnel data path has four layers. This section describes the current sta
 - `ipinip.json.j2` auto-generates decap configuration from device metadata
 - `sairedis` includes full SAI API definitions for `SAI_TUNNEL_TYPE_IPINIP`
 
-No encapsulation orchestration exists for generic IPIP. There is no component that creates IPIP tunnels for encap, manages tunnel nexthops, or tracks tunnel state. The new `TunnelIpipMgr` component proposed in this HLD (§5.5) is entirely SAI-based and platform-agnostic.
+No encapsulation orchestration exists for generic IPIP. There is no component that creates IPIP tunnels for encap, manages tunnel nexthops, or tracks tunnel state. The new `TunnelIpipMgr` component proposed in this HLD (§5.4.2) is entirely SAI-based and platform-agnostic.
 
 **SAI Provider (platform-specific) — VPP blocks IPIP.** The VPP SAI provider (`TunnelManager.cpp`, line 111) rejects any tunnel type other than VXLAN with `SAI_STATUS_NOT_IMPLEMENTED`. All upstream control plane processing completes successfully — APP_DB entries are created, orchagent calls SAI — but the SAI provider drops the request. No IPIP operations reach the data plane. Other SAI providers (e.g., Memory/hardware ASIC vendors) may already support `SAI_TUNNEL_TYPE_IPINIP`; the orchestration changes in this HLD would work on those platforms without modification.
 
@@ -178,7 +167,7 @@ TunnelIpipMgr
          └── No interface limit — nexthop objects are lightweight
 ```
 
-Kernel nexthop objects with IPIP encapsulation have been verified working on Linux 5.14. However, FRR currently ignores IPIP encapsulation in nexthop objects (it only handles MPLS), misinterpreting these routes as "directly connected." A **FRR patch** is required to unblock this approach (see §5.6).
+Kernel nexthop objects with IPIP encapsulation have been verified working on Linux 5.14. However, FRR currently ignores IPIP encapsulation in nexthop objects (it only handles MPLS), misinterpreting these routes as "directly connected." A **FRR patch** is required to unblock this approach (see §5.5).
 
 **When to use which:**
 
@@ -189,13 +178,13 @@ Kernel nexthop objects with IPIP encapsulation have been verified working on Lin
 | BFD-driven tunnel state (up/down → route withdrawal) | **Yes** — `ip link set tun0 down` triggers FRR | Not directly — no interface to bring down |
 | Hundreds or thousands of tunnels | No — ~1000 kernel interface limit | **Yes** — nexthop objects are lightweight |
 | Static route steering (route X via tunnel Y) | Yes | **Yes** |
-| No FRR patch required | **Yes** — works today | No — requires FRR patch (§5.6) |
+| No FRR patch required | **Yes** — works today | No — requires FRR patch (§5.5) |
 
 **Use interface-based tunnels** when the tunnel needs to be a first-class network interface — running BGP/OSPF sessions over it, assigning addresses, or using BFD to drive interface state for route withdrawal. This is the right choice for site-to-site connectivity with a moderate number of tunnels.
 
 **Use nexthop-based tunnels** when scale is the primary concern — hundreds or thousands of tunnels where each tunnel simply steers traffic to a remote endpoint without needing to run routing protocols over the tunnel itself. Typical use cases include large-scale overlay fabrics or programmatic tunnel provisioning.
 
-The two approaches are complementary and the implementation supports both. Interface-based tunnels (Mode 1) provide the richest control plane integration and work today without FRR changes. Nexthop-based tunnels (Modes 3 and 4) remove the scale limit but require the FRR patch (§5.6).
+The two approaches are complementary and the implementation supports both. Interface-based tunnels (Mode 1) provide the richest control plane integration and work today without FRR changes. Nexthop-based tunnels (Modes 3 and 4) remove the scale limit but require the FRR patch (§5.5).
 
 #### 4.1.4. Gap Summary
 
@@ -257,7 +246,7 @@ This mode supports full bidirectional tunneling with control plane participation
 - Control plane encap: FRR nexthop-group with `encap ip src <tunnel-src>`, creating kernel nexthop object with `LWTUNNEL_ENCAP_IP`
 - No kernel interface created — uses kernel nexthop objects (unlimited scale)
 - Routes are configured via FRR static routes (`ip route <prefix> nexthop-group <NAME>`) or PBR policies (`set nexthop-group <NAME>`)
-- **Requires FRR patch** to support `encap ip` in nexthop-group CLI and `ip route ... nexthop-group` in staticd (§5.6)
+- **Requires FRR patch** to support `encap ip` in nexthop-group CLI and `ip route ... nexthop-group` in staticd (§5.5)
 - Use cases:
   - **Static route steering**: FRR static routes via nexthop-group — routes are redistributable via BGP
   - **PBR service chaining**: PBR policy matches traffic by src/dst IP and steers it through IPIP tunnel to a middlebox (firewall, DPI, load balancer) that strips the outer header; return traffic takes a different (non-tunnel) path
@@ -439,13 +428,21 @@ Step 3: RouteOrch creates SAI route
 
 **Data plane traffic** flows through VPP/SAI. Packets matching the SAI route hit the SAI tunnel encap nexthop, VPP adds the outer IP header, and sends the encapsulated packet via the underlay. Decap works via the SAI tunnel term entry — incoming IPIP packets matching the term entry have their outer header stripped.
 
-### 5.4. Phase 1: VPP SAI Decapsulation
+### 5.4. Phase 1: Interface Mode and Decap-Only (Modes 1 and 2)
+
+#### 5.4.0. Overview
+
+Phase 1 delivers the complete end-to-end IPIP tunnel solution for interface-based tunnels (Mode 1) and decap-only tunnels (Mode 2). This includes: VPP SAI provider IPINIP support, TunnelIpipMgr orchestration, kernel interface management, BFD integration, fpmsyncd tunnel detection, and RouteOrch nexthop resolution. No FRR changes required.
+
+The following subsections are organized by component.
+
+#### 5.4.1. VPP SAI Provider Changes
 
 **Files to modify:** `sonic-buildimage/platform/vpp/saivpp/src/TunnelManager.cpp`, `sonic-buildimage/platform/vpp/saivpp/src/TunnelManager.h`, `sonic-buildimage/platform/vpp/saivpp/vppxlate/SaiVppXlate.cpp`
 
 **No changes to:** orchagent, tunneldecaporch, fpmsyncd, APP_DB schema.
 
-#### 5.4.1. Accept IPIP Tunnel Type in TunnelManager
+##### 5.4.1.1. Accept IPIP Tunnel Type in TunnelManager
 
 The existing VXLAN-only guard in `TunnelManager::create_tunnel()` (line 111) is extended to accept `SAI_TUNNEL_TYPE_IPINIP`:
 
@@ -466,7 +463,7 @@ if (attr.value.s32 != SAI_TUNNEL_TYPE_VXLAN &&
 
 The `create_tunnel()` dispatch then branches to the new IPIP path when `tunnel_type == SAI_TUNNEL_TYPE_IPINIP`.
 
-#### 5.4.2. IPIP Tunnel Creation via VPP API
+##### 5.4.1.2. IPIP Tunnel Creation via VPP API
 
 A new function `create_vpp_ipip_decap()` translates SAI tunnel attributes to a VPP `ipip_add_tunnel` API call:
 
@@ -487,7 +484,7 @@ Auto-assigned                         →    tunnel.instance = ~0
 
 The VPP API wrapper `vpp_ipip_tunnel_add_del()` in `SaiVppXlate.cpp` allocates a `vapi_msg_ipip_add_tunnel`, fills the tunnel parameters, and sends via the VAPI context. On success, it returns the `sw_if_index` of the created tunnel interface.
 
-#### 5.4.3. DSCP/ECN/TTL Header Handling
+##### 5.4.1.3. DSCP/ECN/TTL Header Handling
 
 IPIP tunnel header handling follows the SAI tunnel attribute model. These attributes are read from the tunnel object and translated to VPP tunnel flags:
 
@@ -504,17 +501,17 @@ IPIP tunnel header handling follows the SAI tunnel attribute model. These attrib
 | `ENCAP_TTL_MODE` | Pipe | Outer TTL set to configured value |
 | `ENCAP_TTL_MODE` | Uniform | Outer TTL copied from inner |
 
-#### 5.4.4. IPIP Tunnel Deletion
+##### 5.4.1.4. IPIP Tunnel Deletion
 
 Tunnel deletion mirrors creation: `remove_vpp_ipip_tunnel()` calls `vpp_ipip_tunnel_add_del()` with `is_add=0` using the stored `sw_if_index`. The dispatch in `remove_tunnel()` branches on tunnel type identically to `create_tunnel()`.
 
-### 5.5. Phase 2: IPIP Encapsulation with BFD Integration
+#### 5.4.2. IPIP Encapsulation with BFD Integration
 
 **New files:** `sonic-buildimage/src/sonic-swss/orchagent/tunnelipipmgr.h`, `sonic-buildimage/src/sonic-swss/orchagent/tunnelipipmgr.cpp`
 
 **Files to modify:** `sonic-buildimage/src/sonic-swss/orchagent/bfdorch.h`, `sonic-buildimage/src/sonic-swss/orchagent/bfdorch.cpp`, `sonic-buildimage/src/sonic-swss/orchagent/nhgorch.cpp`, `sonic-buildimage/src/sonic-swss/orchagent/routeorch.cpp`
 
-#### 5.5.1. TunnelIpipMgr — New Orchestration Component
+##### 5.4.2.1. TunnelIpipMgr — New Orchestration Component
 
 `TunnelIpipMgr` is the central manager for all IPIP tunnel modes (Modes 1–4). It runs inside the **orchagent process** and subscribes directly to `CONFIG_DB:TUNNEL_IPIP`. This follows the established SONiC pattern — multiple orchs already subscribe to CONFIG_DB directly, including CrmOrch (`CFG_CRM`), QosOrch (`CFG_DSCP_TO_TC_MAP`, etc.), NvgreTunnelOrch (`CFG_NVGRE_TUNNEL`), VNetCfgRouteOrch (`CFG_VNET_RT`), Srv6Orch (`CFG_SRV6_MY_SID`), and others.
 
@@ -658,7 +655,7 @@ TunnelIpipMgr creates only the SAI tunnel + encap nexthop (data plane). FRR hand
 
 **Required changes for Mode 3 (beyond Mode 1):**
 
-- **FRR patch (§5.6)** — extended scope:
+- **FRR patch (§5.5)** — extended scope:
   1. Add `encap ip src <IP>` parameter to nexthop-group submode CLI (`lib/nexthop_group.c`)
   2. Add IPIP encap fields to `struct nexthop` and `zapi_nexthop` (following the SRv6 `nh_srv6` pattern)
   3. Encode IPIP encap as `LWTUNNEL_ENCAP_IP` in zebra kernel nexthop messages (`zebra/rt_netlink.c`)
@@ -751,7 +748,7 @@ CONFIG_DB:TUNNEL_IPIP entry arrives
 
 `TunnelIpipMgr` implements `BfdOrch::Observer` to receive BFD state change notifications. When BFD transitions to DOWN, it sets the kernel tunnel interface down (`ip link set tun0 down`). FRR detects the interface state change and withdraws routes. When BFD recovers, the reverse occurs. BFD is only applicable to Mode 1 (interface-based tunnels).
 
-#### 5.5.2. Dual-Path Architecture
+##### 5.4.2.2. Dual-Path Architecture
 
 For Mode 1 (Interface Mode), each IPIP tunnel has two parallel paths:
 
@@ -772,7 +769,7 @@ For Mode 1 (Interface Mode), each IPIP tunnel has two parallel paths:
 
 The SAI tunnel handles all data plane traffic at line rate. The kernel tunnel enables control plane participation — FRR can assign IP addresses to `tun0`, run BGP sessions over it, and advertise routes via the tunnel interface. Both paths share the same tunnel endpoints but operate independently.
 
-#### 5.5.3. BFD-Based Tunnel State Management
+##### 5.4.2.3. BFD-Based Tunnel State Management
 
 Neither VPP nor Linux IPIP tunnels automatically track destination reachability — a tunnel interface stays UP even when the remote endpoint is unreachable. BFD provides active probing to detect failures.
 
@@ -792,11 +789,11 @@ BFD was chosen over VPP FIB tracking because FIB-based tracking would incorrectl
 | **Overhead** | Low (3–5 small UDP packets/sec) | None |
 | **Standard** | RFC 5880/5881 | N/A |
 
-#### 5.5.4. CONFIG_DB Schema
+##### 5.4.2.4. CONFIG_DB Schema
 
 **New table:** `TUNNEL_IPIP|<tunnel_name>`
 
-##### 5.5.4.1. Field Definitions
+###### 5.4.2.4.1. Field Definitions
 
 | Field | Type | Required | Values | Default | Description |
 |-------|------|----------|--------|---------|-------------|
@@ -805,7 +802,7 @@ BFD was chosen over VPP FIB tracking because FIB-based tracking would incorrectl
 | `dst_ip` | IP address | Conditional | IPv4 or IPv6 | — | Remote tunnel endpoint. Maps to `SAI_TUNNEL_ATTR_ENCAP_DST_IP`. Required when `peer_mode=P2P`. Omitted when `peer_mode=P2MP` (remote determined per-nexthop). |
 | `peer_mode` | String | Yes | `P2P`, `P2MP` | — | SAI peer mode. `P2P` = fixed remote endpoint. `P2MP` = remote endpoint varies per route nexthop. Maps to `SAI_TUNNEL_ATTR_PEER_MODE`. |
 | `mode` | String | Yes | `encap`, `decap`, `symmetric` | — | Tunnel direction. `encap` = encapsulation only (Mode 3). `decap` = decapsulation only (Mode 2). `symmetric` = both directions (Mode 1 or 4). |
-| `cp_mode` | String | No | `interface`, `nexthop` | `interface` | Control plane approach (see §4.1.3). `interface` = kernel `tun0` per tunnel (Mode 1). `nexthop` = kernel nexthop object with `encap ip` (Modes 3/4, requires FRR patch §5.6). |
+| `cp_mode` | String | No | `interface`, `nexthop` | `interface` | Control plane approach (see §4.1.3). `interface` = kernel `tun0` per tunnel (Mode 1). `nexthop` = kernel nexthop object with `encap ip` (Modes 3/4, requires FRR patch §5.5). |
 | `dscp_mode` | String | No | `uniform`, `pipe` | `uniform` | DSCP handling for encap and decap. `uniform` = copy between inner/outer. `pipe` = use fixed value (see `dscp`). |
 | `dscp` | Integer | No | 0–63 | `0` | Fixed outer DSCP value for encap when `dscp_mode=pipe`. Ignored when `dscp_mode=uniform`. |
 | `ecn_mode` | String | No | `copy_from_outer`, `standard` | `standard` | ECN decap handling. `copy_from_outer` = inner ECN set to outer. `standard` = RFC 3168 compliant. |
@@ -820,7 +817,7 @@ BFD was chosen over VPP FIB tracking because FIB-based tracking would incorrectl
 | `df_mode` | String | No | `copy`, `set`, `clear` | `copy` | DF bit policy on outer IPv4 header. `copy` = inherit from inner (recommended). `set` = always DF=1. `clear` = always DF=0 (**not recommended** — VPP drops outer fragments at decap). Maps to VPP `ENCAP_COPY_DF` / `ENCAP_SET_DF` flags. See §5.8 for details. |
 | `tunnel_ip` | IP address | No | IPv4 or IPv6 | `src_ip/32` | IP address to assign to the kernel tunnel interface (`iptun<N>`). Only valid when `cp_mode=interface`. Defaults to `src_ip/32` if omitted. Override when a different routable address is needed on the tunnel interface. |
 
-##### 5.5.4.2. How Fields Determine the Operational Mode
+###### 5.4.2.4.2. How Fields Determine the Operational Mode
 
 The combination of `mode` and `cp_mode` determines which operational mode (§5.1) is used, what kernel objects are created, and what SAI objects are programmed:
 
@@ -832,19 +829,19 @@ The combination of `mode` and `cp_mode` determines which operational mode (§5.1
 | `symmetric` | `nexthop` | **Mode 4** (Bidirectional) | kernel nexthop obj | Tunnel + encap nexthop + decap term entry |
 | `encap` | `interface` | **Mode 1 variant** | kernel `tun0` | Tunnel + encap nexthop *(no decap term)* |
 
-##### 5.5.4.3. Validation Rules
+###### 5.4.2.4.3. Validation Rules
 
 - `src_ip` and `dst_ip` must be the same address family (both IPv4 or both IPv6)
 - `dst_ip` is required when `peer_mode=P2P`, must be omitted when `peer_mode=P2MP`
 - No duplicate `src_ip` + `dst_ip` pairs across tunnel entries
-- `cp_mode=nexthop` requires the FRR patch (§5.6); TunnelIpipMgr logs a warning if used without it
+- `cp_mode=nexthop` requires the FRR patch (§5.5); TunnelIpipMgr logs a warning if used without it
 - `bfd_enable=true` is only valid when `cp_mode=interface` (nexthop-based tunnels have no interface to bring down)
 - `dscp` field is only meaningful when `dscp_mode=pipe`
 - `ttl` field is only meaningful when `ttl_mode=pipe`
 - `bfd_min_tx` / `bfd_min_rx`: 50,000–30,000,000 microseconds (50ms–30s)
 - `bfd_detect_mult`: 1–255
 
-##### 5.5.4.4. Configuration Examples
+###### 5.4.2.4.4. Configuration Examples
 
 **Example 1 — P2P symmetric tunnel with interface mode and BFD (Mode 1):**
 
@@ -905,7 +902,7 @@ This creates:
 - SAI tunnel with encap nexthop
 - Kernel nexthop object: `ip nexthop add id <auto> encap ip dst 10.4.0.1 src 10.1.0.1 dev <underlay>`
 - No kernel interface (unlimited scale)
-- Requires FRR patch (§5.6)
+- Requires FRR patch (§5.5)
 
 **Example 4 — Simple symmetric tunnel, no BFD (Mode 1, minimal config):**
 
@@ -920,7 +917,7 @@ redis-cli HSET "TUNNEL_IPIP|SimpleTunnel" \
 
 This uses all defaults: `cp_mode=interface`, `dscp_mode=uniform`, `ttl_mode=pipe`, `ttl=255`, `bfd_enable=false`. Tunnel is always UP.
 
-#### 5.5.5. NhgOrch and RouteOrch Integration
+##### 5.4.2.5. NhgOrch and RouteOrch Integration
 
 IPIP tunnel nexthops are integrated into the existing nexthop resolution path, following the VXLAN pattern:
 
@@ -936,11 +933,11 @@ redis-cli HSET "ROUTE_TABLE:172.16.0.0/16" \
     "ifname" "Tunnel1"
 ```
 
-### 5.6. Phase 3: FRR Patch for Kernel Nexthop IPIP Encapsulation
+### 5.5. Phase 2: FRR Patch for Kernel Nexthop IPIP Encapsulation
 
 **Files to modify:** `sonic-buildimage/src/sonic-frr/frr/zebra/rt_netlink.c`, `sonic-buildimage/src/sonic-frr/frr/zebra/rt_netlink.h`, `sonic-buildimage/src/sonic-frr/frr/zebra/zebra_nhg.h`, `sonic-buildimage/src/sonic-frr/frr/zebra/zebra_vty.c`
 
-#### 5.6.1. Root Cause — FRR Only Handles MPLS Encapsulation
+#### 5.5.1. Root Cause — FRR Only Handles MPLS Encapsulation
 
 Kernel nexthop objects with IPIP encapsulation work correctly:
 
@@ -983,7 +980,7 @@ if (tb[NHA_ENCAP] && tb[NHA_ENCAP_TYPE]) {
 
 FRR has had nexthop object support since version 7.3, but only for MPLS encapsulation. `LWTUNNEL_ENCAP_IP` is silently ignored.
 
-#### 5.6.2. Required FRR Changes
+#### 5.5.2. Required FRR Changes
 
 The FRR patch has two scopes: a **core scope** required for all nexthop-based modes (Modes 3/4), and an **extended scope** that enables FRR-native IPIP nexthop management.
 
@@ -1042,7 +1039,7 @@ Routing entry for 172.16.0.0/16
 
 **Upstream feasibility:** Each change has a working precedent in FRR — VNI in nexthop-group (existing), SRv6 encap in nexthop struct (existing), LWTUNNEL_ENCAP_IP encoding in zebra (existing for EVPN), PBR nexthop-group expansion (existing). The design is generic and extends to other tunnel types (GRE, SRv6) by adding additional encap parameters to the same CLI framework.
 
-#### 5.6.3. Impact on Tunnel Modes
+#### 5.5.3. Impact on Tunnel Modes
 
 | Mode | FRR Patch Required? | Reason |
 |------|---------------------|--------|
@@ -1053,6 +1050,10 @@ Routing entry for 172.16.0.0/16
 
 **Workaround**: Use Mode 1 (Interface Mode) for initial deployment without the FRR patch. Mode 1 works with standard kernel tunnel interfaces but is limited to ~1000 tunnels.
 
+### 5.6. Phase 3: Nexthop-Based Tunnel Modes (Modes 3 and 4)
+
+Phase 3 integrates Phase 2's FRR nexthop-group support with SONiC to enable the nexthop-based tunnel modes. Includes: frrcfgd integration to generate FRR nexthop-group and static route config from CONFIG_DB, fpmsyncd `NHA_ENCAP` parsing for IPIP nexthop metadata, and TunnelIpipMgr `cp_mode=nexthop` path with SAI/FRR coordination. Depends on Phase 2. Removes the ~1000 tunnel scale limit of Mode 1.
+
 ### 5.7. Implementation Considerations
 
 #### 5.7.1. YANG Model
@@ -1061,8 +1062,8 @@ A new `sonic-tunnel-ipip.yang` model is required for CONFIG_DB validation of the
 
 The new YANG model defines:
 - Key: tunnel name matching pattern `[a-zA-Z][a-zA-Z0-9_-]+` (excludes `MuxTunnel*` to avoid conflict with dual-ToR)
-- All fields from §5.5.4.1 with types, ranges, and defaults
-- Validation constraints from §5.5.4.3 (address family match, conditional `dst_ip`, BFD constraints)
+- All fields from §5.4.2.4.1 with types, ranges, and defaults
+- Validation constraints from §5.4.2.4.3 (address family match, conditional `dst_ip`, BFD constraints)
 
 **File:** `sonic-yang-models/yang-models/sonic-tunnel-ipip.yang`
 
