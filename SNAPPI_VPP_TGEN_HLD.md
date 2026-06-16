@@ -1,13 +1,14 @@
 # Snappi-VPP Traffic Generator High Level Design
 
 **Revision:** 1.0  
-**Status:** Draft   
+**Status:** Draft  
+**Author:** Reji Thomas
 
 ### Revision History
 
-| Revision | Date | Summary |
-|---|---|---|
-| 1.0 | Jun 2026 | SONiC HLD - Initial draft. |
+| Rev | Date | Author | Change Description |
+|---|---|---|---|
+| 1.0 | 2026-06-16 | Reji Thomas | Initial version |
 
 ### Terminology
 
